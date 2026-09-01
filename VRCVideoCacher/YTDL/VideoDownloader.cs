@@ -103,6 +103,65 @@ public class VideoDownloader
         OnQueueChanged?.Invoke();
     }
 
+    /// <summary>
+    /// In-flight pre-downloads. VRChat retries a URL lookup it considers failed, and a rhythm-game world
+    /// asks again when the player reselects the song, so the same video can arrive several times while the
+    /// first download is still running. They must all join that one download rather than start their own.
+    /// </summary>
+    private static readonly ConcurrentDictionary<string, Lazy<Task<bool>>> PreDownloads = new();
+
+    /// <summary>
+    /// Downloads the video now and waits for it, instead of queueing it behind whatever else is pending.
+    /// This is what lets a request answer with a finished local file rather than a restream.
+    ///
+    /// Returns true only when the file landed in the cache within <paramref name="budget"/>. On timeout it
+    /// returns false but leaves the download running: the bytes are already half-fetched, and abandoning
+    /// them would make the next play pay for the same wait again.
+    /// </summary>
+    public static async Task<bool> PreDownloadAsync(VideoInfo videoInfo, TimeSpan budget)
+    {
+        if (string.IsNullOrEmpty(videoInfo.VideoId) || videoInfo.UrlType != UrlType.YouTube)
+            return false;
+
+        var key = $"{videoInfo.VideoId}:{videoInfo.DownloadFormat}";
+        var download = PreDownloads.GetOrAdd(key, k => new Lazy<Task<bool>>(
+            () => RunPreDownloadAsync(k, videoInfo), LazyThreadSafetyMode.ExecutionAndPublication)).Value;
+
+        if (await Task.WhenAny(download, Task.Delay(budget)) != download)
+        {
+            Log.Information("Pre-download of {VideoId} is taking longer than {Seconds}s, " +
+                            "falling back for this play and finishing in the background",
+                videoInfo.VideoId, budget.TotalSeconds);
+            return false;
+        }
+
+        return await download;
+    }
+
+    private static async Task<bool> RunPreDownloadAsync(string key, VideoInfo videoInfo)
+    {
+        _currentDownload = videoInfo;
+        OnDownloadStarted?.Invoke(videoInfo);
+        var success = false;
+        try
+        {
+            success = await DownloadYouTubeVideo(videoInfo);
+        }
+        catch (Exception ex)
+        {
+            Log.Error("Exception during pre-download: {Ex}", ex.ToString());
+        }
+        finally
+        {
+            PreDownloads.TryRemove(key, out _);
+            OnDownloadCompleted?.Invoke(videoInfo, success);
+            OnQueueChanged?.Invoke();
+            if (ReferenceEquals(_currentDownload, videoInfo))
+                _currentDownload = null;
+        }
+        return success;
+    }
+
     public static void ClearQueue()
     {
         DownloadQueue.Clear();

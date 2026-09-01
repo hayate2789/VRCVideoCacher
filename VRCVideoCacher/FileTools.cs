@@ -15,6 +15,13 @@ public class FileTools
     private static readonly string? BackupPathReso;
     private static readonly ImmutableList<string> SteamPaths = [".var/app/com.valvesoftware.Steam/data/Steam", ".steam/steam", ".local/share/Steam"];
 
+    /// <summary>
+    /// VRChat's own data directory — where it writes <c>output_log_*.txt</c>. Resolved here because this
+    /// is where the platform differences (Windows LocalLow vs the Proton prefix) are already handled.
+    /// Null when the platform lookup failed.
+    /// </summary>
+    public static string? VrChatDataPath { get; private set; }
+
     static FileTools()
     {
         string resoPath;
@@ -55,6 +62,8 @@ public class FileTools
         {
             throw new NotImplementedException("Unknown platform");
         }
+        VrChatDataPath = Path.Join(localLowPath, "VRChat/VRChat");
+
         var vrcPath = Path.Join(localLowPath, "VRChat/VRChat/Tools/yt-dlp.exe");
         if (!File.Exists(vrcPath))
         {

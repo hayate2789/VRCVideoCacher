@@ -190,6 +190,26 @@ public class ConfigModel
     public bool CacheVrDancing = false;
     public bool CacheOnly = false;
 
+    // Pre-download
+    //
+    // In the worlds listed here, an uncached YouTube video is downloaded BEFORE the URL is handed back,
+    // so the player opens a finished local file instead of the SABR restream. The restream has to mux
+    // every segment on demand, and a segment that arrives late starves the video pipeline while the audio
+    // clock keeps running — which is how one hitch leaves the audio permanently ahead of the picture.
+    // That is unacceptable in a rhythm game, hence per-world opt-in rather than a global switch: the wait
+    // this introduces is only worth it where timing matters.
+    //
+    // Empty list disables the feature. Anything that goes wrong — the world is unknown, the download
+    // fails, the budget runs out — falls through to normal behaviour, so the worst case is what happens
+    // without it.
+    public string[] PreDownloadWorlds = [];
+
+    // How long a request may wait for that download. VRChat gives up on the URL lookup eventually, and a
+    // pre-download that outlives the player's patience turns a playable video into an error — so this is
+    // deliberately shorter than a long download takes. The download itself keeps running in the
+    // background when the budget expires, so the next play is a cache hit.
+    public int PreDownloadTimeoutSeconds = 60;
+
     // Cache Rules
     public string[] BlockedUrls = ["https://na2.vrdancing.club/sampleurl.mp4"];
     public string BlockRedirect = "https://www.youtube.com/watch?v=byv2bKekeWQ";

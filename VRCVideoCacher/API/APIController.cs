@@ -5,6 +5,7 @@ using EmbedIO.WebApi;
 using VRCVideoCacher.Database;
 using VRCVideoCacher.Models;
 using VRCVideoCacher.Services;
+using VRCVideoCacher.Utils;
 using VRCVideoCacher.YTDL;
 
 namespace VRCVideoCacher.API;
@@ -168,6 +169,22 @@ public class ApiController : WebApiController
             return;
         }
 
+        // In a pre-download world, fetch the whole video before answering so the player opens a finished
+        // local file. Placed after CacheOnly, which is the stricter setting and still wins, and before the
+        // restream, which this replaces when it succeeds.
+        if (await TryPreDownloadAsync(videoInfo))
+        {
+            var (preCached, preCachedPath, preCachedName) = GetCachedFile(videoInfo.VideoId, avPro);
+            if (preCached)
+            {
+                File.SetLastWriteTimeUtc(preCachedPath, DateTime.UtcNow);
+                var preCachedUrl = $"{ConfigManager.Config.YtdlpWebServerUrl}/{preCachedName}";
+                Log.Information("Responding with pre-downloaded URL: {URL}", preCachedUrl);
+                await HttpContext.SendStringAsync(preCachedUrl, "text/plain", Encoding.UTF8);
+                return;
+            }
+        }
+
         // Testing: force every AVPro YouTube request through the SABR restream path. SABR serves HLS,
         // which only AVPro can play — the Unity built-in player (avpro=false) can't, so it must take the
         // legacy direct-URL path below instead.
@@ -282,6 +299,37 @@ public class ApiController : WebApiController
         Log.Information("Refusing known-unavailable video {VideoId} without contacting YouTube.", videoId);
         HttpContext.Response.StatusCode = 403;
         await HttpContext.SendStringAsync("Video unavailable.", "text/plain", Encoding.UTF8);
+    }
+
+    /// <summary>
+    /// Whether this request should wait for the video to be downloaded first, and whether that finished.
+    ///
+    /// Only worlds the operator listed get the wait: it is paid on every uncached video, and it is only
+    /// worth paying where the restream's timing hurts — a rhythm game whose notes drift out of sync with
+    /// the audio after a single late segment. Everything unknown answers false, so an unreadable log or an
+    /// unrecognised world leaves the request on the normal path rather than stalling it.
+    /// </summary>
+    private static async Task<bool> TryPreDownloadAsync(VideoInfo videoInfo)
+    {
+        var worlds = ConfigManager.Config.PreDownloadWorlds;
+        if (worlds.Length == 0 || videoInfo.UrlType != UrlType.YouTube ||
+            string.IsNullOrEmpty(videoInfo.VideoId))
+            return false;
+
+        // A broadcast has no end to download to, so waiting for one would burn the whole budget and then
+        // fall through anyway. The handler marks these with the literal id "live".
+        if (videoInfo.VideoId.Equals("live", StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        var world = VrChatLog.GetCurrentWorldId();
+        if (world is null || !worlds.Contains(world, StringComparer.OrdinalIgnoreCase))
+            return false;
+
+        var budget = TimeSpan.FromSeconds(Math.Max(1, ConfigManager.Config.PreDownloadTimeoutSeconds));
+        Log.Information("Pre-downloading {VideoId} before playback (world {World})",
+            videoInfo.VideoId, world);
+
+        return await VideoDownloader.PreDownloadAsync(videoInfo, budget);
     }
 
     private static (bool isCached, string filePath, string fileName) GetCachedFile(string videoId, bool avPro)
