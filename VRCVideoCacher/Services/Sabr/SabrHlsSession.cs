@@ -35,6 +35,13 @@ internal sealed class SabrHlsSession : ISabrSession
     /// </summary>
     private const int PrebuildAhead = 3;
 
+    /// <summary>
+    /// How many segments the post-fetch sweep muxes at once. Two keeps the build ahead of any player
+    /// without turning the sweep into the stall it exists to prevent: an on-demand build racing it still
+    /// needs a core, and every ffmpeg pass is two processes over tens of megabytes.
+    /// </summary>
+    private const int SweepConcurrency = 2;
+
     private static readonly TimeSpan StartTimeout = TimeSpan.FromSeconds(60);
     private static readonly TimeSpan FragmentWaitTimeout = TimeSpan.FromSeconds(30);
 
@@ -49,6 +56,14 @@ internal sealed class SabrHlsSession : ISabrSession
 
     private readonly SemaphoreSlim _fillLock = new(1, 1);
     private readonly ConcurrentDictionary<int, Lazy<Task>> _building = new();
+
+    /// <summary>
+    /// Session lifetime, as opposed to <see cref="_fillCts"/> which a seek replaces. The post-fetch sweep
+    /// outlives any single fill but must stop when the session's directory goes away.
+    /// </summary>
+    private readonly CancellationTokenSource _disposeCts = new();
+
+    private int _sweepStarted;
 
     private CancellationTokenSource _fillCts = new();
     private volatile int _videoFillStart;
@@ -181,8 +196,16 @@ internal sealed class SabrHlsSession : ISabrSession
 
                     // A fill that ran to the end may have completed the set — but only if it started at
                     // the beginning, or an earlier fill already covered the gap. HasAllFragments checks.
-                    if (OnFullyFetched is { } onFullyFetched && HasAllFragments())
-                        await onFullyFetched(this);
+                    if (HasAllFragments())
+                    {
+                        if (OnFullyFetched is { } onFullyFetched)
+                            await onFullyFetched(this);
+
+                        // Every fragment is on disk, so nothing is left to wait for: mux the rest now
+                        // rather than leaving cold segments in the player's path. Started after the
+                        // cache write above so the two never contend for the same cores.
+                        StartFullSweep();
+                    }
                 }
                 catch (OperationCanceledException) { /* superseded by a seek */ }
                 catch (Exception ex)
@@ -257,6 +280,60 @@ internal sealed class SabrHlsSession : ISabrSession
             var segment = i;
             _ = Task.Run(() => BuildSegmentAsync(segment, allowSeek: false));
         }
+    }
+
+    /// <summary>
+    /// Muxes every segment the playhead has not reached yet, once the fetch holds all the fragments.
+    ///
+    /// <see cref="PrebuildAhead"/> only looks three segments past the one being served, which a player
+    /// that requests in bursts outruns — so segments keep getting built cold (0.25-1.6s) in the middle of
+    /// playback instead of being served from disk (~2ms). Those stalls are what starve the video pipeline
+    /// while the audio clock keeps running, which is how a single hitch turns into audio that stays ahead
+    /// of the picture for the rest of the video.
+    ///
+    /// Nothing here can move the fetch — every fragment is already on disk by the time this runs — and
+    /// single-flight stays with <see cref="BuildSegmentAsync"/>, so an on-demand request that races the
+    /// sweep joins the same build rather than starting a second one.
+    /// </summary>
+    private void StartFullSweep()
+    {
+        if (Interlocked.Exchange(ref _sweepStarted, 1) != 0)
+            return;
+
+        var ct = _disposeCts.Token;
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                var next = -1;
+                var workers = new Task[Math.Min(SweepConcurrency, Math.Max(_videoIndex.Count, 1))];
+                for (var w = 0; w < workers.Length; w++)
+                {
+                    workers[w] = Task.Run(async () =>
+                    {
+                        int segment;
+                        while ((segment = Interlocked.Increment(ref next)) < _videoIndex.Count)
+                        {
+                            ct.ThrowIfCancellationRequested();
+                            if (File.Exists(Path.Combine(_dir, HlsPlaylist.SegmentName(segment))))
+                                continue;
+                            await BuildSegmentAsync(segment, allowSeek: false);
+                        }
+                    }, ct);
+                }
+
+                await Task.WhenAll(workers);
+                _log.Debug("SABR {VideoId}: pre-mux sweep complete ({Count} segments)",
+                    _videoId, _videoIndex.Count);
+            }
+            catch (OperationCanceledException) { /* session torn down */ }
+            catch (Exception ex)
+            {
+                // Nothing here is required for playback: a failed sweep just means the old cold-build
+                // path handles whatever it did not get to.
+                _log.Debug(ex, "SABR {VideoId}: pre-mux sweep failed", _videoId);
+            }
+        }, ct);
     }
 
     private async Task BuildSegmentAsync(int segment, bool allowSeek = true)
@@ -419,6 +496,7 @@ internal sealed class SabrHlsSession : ISabrSession
 
     public void Dispose()
     {
+        try { _disposeCts.Cancel(); } catch { /* already gone */ }
         try { _fillCts.Cancel(); } catch { /* already gone */ }
         TryDelete(_dir);
     }
